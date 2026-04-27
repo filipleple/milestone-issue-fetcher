@@ -230,14 +230,40 @@ def render_issue_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def yaml_escape(s: str) -> str:
+    """Wrap a string in double quotes if it contains YAML-unsafe characters."""
+    if any(c in s for c in ('"', "'", ':', '#', '[', ']', '{', '}', ',', '&', '*', '?', '|', '-', '<', '>', '=', '!', '%', '@', '`', '\n', '\r')):
+        return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    return s
+
+
+def render_known_issues_yaml(issues: List[Dict[str, Any]]) -> str:
+    lines: List[str] = ["known_issues:"]
+    for issue in issues:
+        title = str(issue.get("title") or "")
+        url = issue.get("html_url") or ""
+        lines.append(f"  - description: {yaml_escape(title)}")
+        lines.append(f"    url: {url}")
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Export GitHub milestone issues to Markdown files.")
+    ap = argparse.ArgumentParser(description="Export GitHub issues to Markdown files.")
     ap.add_argument("--repo", required=True, help="owner/name")
-    ap.add_argument("--milestone", required=True, help='milestone number (e.g. 12) or title (e.g. "v1.2.3")')
-    ap.add_argument("--out", required=True, help="output directory for .md files")
+
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--milestone", help='milestone number (e.g. 12) or title (e.g. "v1.2.3")')
+    source.add_argument("--label", help='issue label name, e.g. "bug" or "help wanted"')
+
+    ap.add_argument("--out", help="output directory for .md files (required unless --known-issues)")
     ap.add_argument("--state", default="all", choices=["open", "closed", "all"], help="issue state filter")
-    ap.add_argument("--include-pull-requests", action="store_true", help="include PRs assigned to the milestone")
+    ap.add_argument("--include-pull-requests", action="store_true", help="include PRs matching the filter")
+    ap.add_argument("--known-issues", action="store_true",
+                    help="output open issues as a YAML known_issues block (to --out file or stdout)")
     args = ap.parse_args()
+
+    if not args.known_issues and not args.out:
+        die("--out is required unless --known-issues is set")
 
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not token:
@@ -246,20 +272,58 @@ def main() -> int:
     owner, repo = get_repo_parts(args.repo)
     repo_full = f"{owner}/{repo}"
 
-    os.makedirs(args.out, exist_ok=True)
-
     with requests.Session() as session:
         headers = gh_headers(token)
 
-        ms_number = resolve_milestone_number(session, headers, owner, repo, args.milestone)
-
         issues_url = f"{API}/repos/{owner}/{repo}/issues"
+
+        if args.known_issues:
+            query: Dict[str, Any] = {
+                "state": "open",
+                "sort": "created",
+                "direction": "asc",
+            }
+            if args.milestone:
+                ms_number = resolve_milestone_number(session, headers, owner, repo, args.milestone)
+                query["milestone"] = ms_number
+            if args.label:
+                query["labels"] = args.label
+
+            issues: List[Dict[str, Any]] = []
+            for issue in paginate(session, issues_url, headers, params=query):
+                if (not args.include_pull_requests) and issue.get("pull_request"):
+                    continue
+                issues.append(issue)
+
+            yaml_output = render_known_issues_yaml(issues)
+
+            if args.out:
+                with open(args.out, "w", encoding="utf-8") as f:
+                    f.write(yaml_output)
+                print(f"wrote {args.out}", file=sys.stderr)
+            else:
+                sys.stdout.write(yaml_output)
+
+            return 0
+
+        os.makedirs(args.out, exist_ok=True)
+
         query = {
             "state": args.state,
-            "milestone": ms_number,
             "sort": "created",
             "direction": "asc",
         }
+
+        export_title = ""
+
+        if args.milestone:
+            ms_number = resolve_milestone_number(session, headers, owner, repo, args.milestone)
+            query["milestone"] = ms_number
+            export_title = f"Milestone export: {repo_full} / {args.milestone}"
+
+        if args.label:
+            query["labels"] = args.label
+            export_title = f"Label export: {repo_full} / {args.label}"
 
         exported: List[Tuple[int, str]] = []
         for issue in paginate(session, issues_url, headers, params=query):
@@ -282,14 +346,13 @@ def main() -> int:
 
         index_path = os.path.join(args.out, "_index.md")
         with open(index_path, "w", encoding="utf-8") as f:
-            f.write(f"# Milestone export: {repo_full} / {args.milestone}\n\n")
+            f.write(f"# {export_title}\n\n")
             f.write(f"Exported at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n")
             for num, fname in exported:
                 f.write(f"- #{num} {fname}\n")
         print(f"wrote {index_path}")
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
